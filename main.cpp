@@ -122,8 +122,8 @@ struct Submission {
     int time;
 };
 
-// Frozen submission record
-struct FrozenSubmission {
+// Frozen submission
+struct FrozenSub {
     int time;
     Status status;
 };
@@ -139,11 +139,13 @@ private:
     unordered_map<string, int> team_index; // team name -> index in teams vector
     vector<Submission> submissions; // all submissions for query
 
-    // Store frozen submissions separately to process during scroll
-    unordered_map<string, vector<pair<int, FrozenSubmission>>> frozen_submissions; // team_name -> [(problem_id, submission)]
+    // Store frozen submissions for scroll processing
+    // team_idx -> problem_id -> list of submissions
+    unordered_map<int, unordered_map<int, vector<FrozenSub>>> frozen_subs;
 
     // For ranking maintenance
     vector<int> ranking; // indices of teams in ranked order
+    bool ranking_dirty = false;
 
 public:
     ICPCSystem() = default;
@@ -221,12 +223,11 @@ public:
             // In frozen state
             problem.frozen_submissions++;
 
-            // Store frozen submission for scroll processing
-            FrozenSubmission fs;
+            // Store frozen submission
+            FrozenSub fs;
             fs.time = time;
             fs.status = status;
-            string key = team_name + ":" + to_string(problem_id);
-            // We'll store in a simplified way for now
+            frozen_subs[team_idx][problem_id].push_back(fs);
             return;
         }
 
@@ -234,7 +235,7 @@ public:
         if (status == Status::ACCEPTED) {
             // First AC for this problem
             team.addSolve(problem_id, time, problem.wrong_before_ac);
-            updateRanking();
+            ranking_dirty = true;
         } else {
             // Wrong submission
             problem.wrong_before_ac++;
@@ -243,8 +244,11 @@ public:
 
     // Flush scoreboard
     void flush() {
+        if (ranking_dirty) {
+            updateRanking();
+            ranking_dirty = false;
+        }
         cout << "[Info]Flush scoreboard.\n";
-        // Ranking is already updated after each submission when not frozen
     }
 
     // Freeze scoreboard
@@ -273,12 +277,92 @@ public:
         // Print scoreboard before scrolling
         printScoreboard();
 
-        // Simplified scroll: just clear all frozen submissions
-        // In a full implementation, we would need to simulate the unfreezing process
-        for (auto& team : teams) {
-            for (int pid = 0; pid < problem_count; pid++) {
-                team.problems[pid].frozen_submissions = 0;
+        // Process scroll
+        vector<string> ranking_changes;
+
+        // Continue until no frozen problems
+        while (true) {
+            // Find lowest-ranked team with frozen problems
+            int target_team_idx = -1;
+            int target_problem_id = -1;
+
+            // Search from lowest rank (end of ranking vector) to highest
+            for (int i = ranking.size() - 1; i >= 0; i--) {
+                int team_idx = ranking[i];
+                Team& team = teams[team_idx];
+
+                // Check if this team has frozen problems
+                for (int pid = 0; pid < problem_count; pid++) {
+                    if (team.problems[pid].frozen_submissions > 0 && !team.problems[pid].solved) {
+                        target_team_idx = team_idx;
+                        target_problem_id = pid;
+                        break;
+                    }
+                }
+                if (target_team_idx != -1) break;
             }
+
+            if (target_team_idx == -1) {
+                // No more frozen problems
+                break;
+            }
+
+            // Unfreeze this problem
+            Team& team = teams[target_team_idx];
+            ProblemInfo& problem = team.problems[target_problem_id];
+
+            // Process frozen submissions for this problem
+            auto& subs = frozen_subs[target_team_idx][target_problem_id];
+            bool solved_during_freeze = false;
+            int solve_time = 0;
+            int wrong_before = problem.wrong_before_ac;
+
+            for (auto& sub : subs) {
+                if (sub.status == Status::ACCEPTED && !solved_during_freeze) {
+                    // First AC during freeze
+                    solved_during_freeze = true;
+                    solve_time = sub.time;
+                    problem.wrong_before_ac = wrong_before;
+                    problem.first_ac_time = solve_time;
+                    problem.solved = true;
+                } else if (!solved_during_freeze) {
+                    // Wrong submission before first AC
+                    wrong_before++;
+                }
+            }
+
+            // Clear frozen submissions
+            problem.frozen_submissions = 0;
+            frozen_subs[target_team_idx].erase(target_problem_id);
+            if (frozen_subs[target_team_idx].empty()) {
+                frozen_subs.erase(target_team_idx);
+            }
+
+            if (solved_during_freeze) {
+                // Team solved this problem during freeze
+                team.addSolve(target_problem_id, solve_time, problem.wrong_before_ac);
+                ranking_dirty = true;
+
+                // Update ranking
+                if (ranking_dirty) {
+                    updateRanking();
+                    ranking_dirty = false;
+                }
+
+                // Check if ranking changed for this team
+                // For now, we'll output a placeholder
+                // In full implementation, we need to track which team was displaced
+                string change = team.name + " X " + to_string(team.solved) + " " + to_string(team.penalty);
+                ranking_changes.push_back(change);
+            } else {
+                // No AC during freeze, just update wrong count
+                problem.wrong_before_ac = wrong_before;
+            }
+        }
+
+        // Output ranking changes
+        for (auto& change : ranking_changes) {
+            cout << change << "\n";
         }
 
         frozen = false;
@@ -301,6 +385,12 @@ public:
         }
 
         int team_idx = it->second;
+        // Make sure ranking is up to date
+        if (ranking_dirty && !frozen) {
+            updateRanking();
+            ranking_dirty = false;
+        }
+
         // Find ranking position
         int rank = 1;
         for (size_t i = 0; i < ranking.size(); i++) {
@@ -366,6 +456,12 @@ private:
 
     // Print scoreboard
     void printScoreboard() {
+        // Ensure ranking is up to date
+        if (ranking_dirty && !frozen) {
+            updateRanking();
+            ranking_dirty = false;
+        }
+
         for (int team_idx : ranking) {
             Team& team = teams[team_idx];
 
