@@ -2,7 +2,6 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <set>
 #include <algorithm>
 #include <unordered_map>
 
@@ -30,21 +29,18 @@ string statusToString(Status s) {
     }
 }
 
-struct ProblemInfo {
-    bool solved = false;
-    int first_ac_time = 0;
-    int wrong_before_ac = 0;
-    int frozen_submissions = 0;
-};
-
 struct Team {
     string name;
     int solved = 0;
     int penalty = 0;
-    vector<int> solve_times; // sorted descending
-    ProblemInfo problems[MAX_PROBLEMS];
+    vector<int> solve_times;
+    struct Problem {
+        bool solved = false;
+        int first_ac_time = 0;
+        int wrong_before_ac = 0;
+        int frozen = 0;
+    } problems[MAX_PROBLEMS];
 
-    // For set ordering
     bool operator<(const Team& other) const {
         if (solved != other.solved) return solved > other.solved;
         if (penalty != other.penalty) return penalty < other.penalty;
@@ -55,44 +51,32 @@ struct Team {
         return name < other.name;
     }
 
-    void addSolve(int pid, int time, int wrong_before) {
+    void addSolve(int pid, int time, int wrong) {
         solved++;
-        penalty += 20 * wrong_before + time;
-        // Insert time in descending order
-        auto it = lower_bound(solve_times.begin(), solve_times.end(), time, greater<int>());
-        solve_times.insert(it, time);
+        penalty += 20 * wrong + time;
+        solve_times.push_back(time);
+        sort(solve_times.begin(), solve_times.end(), greater<int>());
         problems[pid].solved = true;
         problems[pid].first_ac_time = time;
-        problems[pid].wrong_before_ac = wrong_before;
+        problems[pid].wrong_before_ac = wrong;
     }
 };
 
 struct Submission {
-    string team_name, problem_name;
+    string team, problem;
     Status status;
     int time;
 };
 
-class ICPCSystem {
+class System {
     bool started = false, frozen = false;
     int duration, problem_count;
     vector<Team> teams;
-    unordered_map<string, int> team_index; // name -> index in teams
+    unordered_map<string, int> team_index;
     vector<Submission> submissions;
-
-    // For ranking: set of team indices sorted by their Team comparison
-    struct TeamCompare {
-        const vector<Team>* teams;
-        TeamCompare(const vector<Team>* t) : teams(t) {}
-        bool operator()(int a, int b) const {
-            return (*teams)[a] < (*teams)[b];
-        }
-    };
-    set<int, TeamCompare> ranking;
+    vector<int> ranking;
 
 public:
-    ICPCSystem() : ranking(TeamCompare(&teams)) {}
-
     void addTeam(const string& name) {
         if (started) {
             cout << "[Error]Add failed: competition has started.\n";
@@ -102,10 +86,8 @@ public:
             cout << "[Error]Add failed: duplicated team name.\n";
             return;
         }
-        Team t;
-        t.name = name;
         team_index[name] = teams.size();
-        teams.push_back(t);
+        teams.push_back({name});
         cout << "[Info]Add successfully.\n";
     }
 
@@ -117,8 +99,11 @@ public:
         duration = dur;
         problem_count = pc;
         started = true;
-        // Initial ranking: lexicographic by name
-        for (size_t i = 0; i < teams.size(); i++) ranking.insert(i);
+        ranking.resize(teams.size());
+        for (size_t i = 0; i < teams.size(); i++) ranking[i] = i;
+        sort(ranking.begin(), ranking.end(), [this](int a, int b) {
+            return teams[a].name < teams[b].name;
+        });
         cout << "[Info]Competition starts.\n";
     }
 
@@ -127,24 +112,22 @@ public:
         int pid = prob[0] - 'A';
         int idx = team_index[team];
         Team& tm = teams[idx];
-        ProblemInfo& pi = tm.problems[pid];
+        auto& pr = tm.problems[pid];
 
         submissions.push_back({team, prob, status, t});
 
-        if (pi.solved) return;
+        if (pr.solved) return;
 
         if (frozen) {
-            pi.frozen_submissions++;
+            pr.frozen++;
             return;
         }
 
         if (status == Status::ACCEPTED) {
-            // Remove team from ranking, update, reinsert
-            ranking.erase(idx);
-            tm.addSolve(pid, t, pi.wrong_before_ac);
-            ranking.insert(idx);
+            tm.addSolve(pid, t, pr.wrong_before_ac);
+            updateRanking();
         } else {
-            pi.wrong_before_ac++;
+            pr.wrong_before_ac++;
         }
     }
 
@@ -169,10 +152,10 @@ public:
         cout << "[Info]Scroll scoreboard.\n";
         flush();
         printScoreboard();
-        // Simplified scroll
+        // Just unfreeze all
         for (auto& team : teams) {
             for (int i = 0; i < problem_count; i++) {
-                team.problems[i].frozen_submissions = 0;
+                team.problems[i].frozen = 0;
             }
         }
         frozen = false;
@@ -187,11 +170,12 @@ public:
         cout << "[Info]Complete query ranking.\n";
         if (frozen) cout << "[Warning]Scoreboard is frozen. The ranking may be inaccurate until it were scrolled.\n";
         int idx = team_index[team];
-        // Find rank by iterating through set
         int rank = 1;
-        for (int t_idx : ranking) {
-            if (t_idx == idx) break;
-            rank++;
+        for (size_t i = 0; i < ranking.size(); i++) {
+            if (ranking[i] == idx) {
+                rank = i + 1;
+                break;
+            }
         }
         cout << team << " NOW AT RANKING " << rank << "\n";
     }
@@ -208,8 +192,8 @@ public:
 
         Submission* last = nullptr;
         for (auto it = submissions.rbegin(); it != submissions.rend(); ++it) {
-            if (it->team_name != team) continue;
-            if (!all_prob && it->problem_name != prob) continue;
+            if (it->team != team) continue;
+            if (!all_prob && it->problem != prob) continue;
             if (!all_stat && it->status != target) continue;
             last = &(*it);
             break;
@@ -217,7 +201,7 @@ public:
         if (!last) {
             cout << "Cannot find any submission.\n";
         } else {
-            cout << last->team_name << " " << last->problem_name << " "
+            cout << last->team << " " << last->problem << " "
                  << statusToString(last->status) << " " << last->time << "\n";
         }
     }
@@ -227,26 +211,37 @@ public:
     }
 
 private:
+    void updateRanking() {
+        sort(ranking.begin(), ranking.end(), [this](int a, int b) {
+            return teams[a] < teams[b];
+        });
+    }
+
     void printScoreboard() {
-        int rank_num = 1;
         for (int idx : ranking) {
             Team& tm = teams[idx];
-            cout << tm.name << " " << rank_num << " " << tm.solved << " " << tm.penalty;
+            int rank = 1;
+            for (size_t i = 0; i < ranking.size(); i++) {
+                if (ranking[i] == idx) {
+                    rank = i + 1;
+                    break;
+                }
+            }
+            cout << tm.name << " " << rank << " " << tm.solved << " " << tm.penalty;
             for (int i = 0; i < problem_count; i++) {
-                auto& pi = tm.problems[i];
-                if (pi.frozen_submissions > 0) {
-                    if (pi.wrong_before_ac == 0) cout << " 0/" << pi.frozen_submissions;
-                    else cout << " -" << pi.wrong_before_ac << "/" << pi.frozen_submissions;
-                } else if (pi.solved) {
-                    if (pi.wrong_before_ac == 0) cout << " +";
-                    else cout << " +" << pi.wrong_before_ac;
+                auto& pr = tm.problems[i];
+                if (pr.frozen > 0) {
+                    if (pr.wrong_before_ac == 0) cout << " 0/" << pr.frozen;
+                    else cout << " -" << pr.wrong_before_ac << "/" << pr.frozen;
+                } else if (pr.solved) {
+                    if (pr.wrong_before_ac == 0) cout << " +";
+                    else cout << " +" << pr.wrong_before_ac;
                 } else {
-                    if (pi.wrong_before_ac == 0) cout << " .";
-                    else cout << " -" << pi.wrong_before_ac;
+                    if (pr.wrong_before_ac == 0) cout << " .";
+                    else cout << " -" << pr.wrong_before_ac;
                 }
             }
             cout << "\n";
-            rank_num++;
         }
     }
 };
@@ -254,7 +249,7 @@ private:
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-    ICPCSystem sys;
+    System sys;
     string line;
     while (getline(cin, line)) {
         if (line.empty()) continue;
